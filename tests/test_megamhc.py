@@ -110,8 +110,9 @@ def test_mega_mhc_graph_replay():
         verify(out, reference(args, use_norm=False))
 
 
-def test_mega_mhc_projection_cancellation():
-    tokens, hidden, streams = 4097, 521, 4
+@pytest.mark.parametrize("tokens", [4097, 8193])
+def test_mega_mhc_projection_cancellation(tokens):
+    hidden, streams = 521, 4
     args = make_inputs(tokens, hidden, streams)
     x, residual, post, comb, fn, scale, base, norm = args
     x.zero_()

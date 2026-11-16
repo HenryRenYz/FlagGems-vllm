@@ -212,7 +212,11 @@ def _launch_pipeline(
         (padded, streams, hidden), dtype=torch.bfloat16, device=device
     )
     packed = torch.empty((3, q, k), dtype=torch.bfloat16, device=device)
-    partial = torch.empty((splits, padded, q), dtype=torch.float32, device=device)
+    # Long queues benefit from streaming residual stores and packing all
+    # split-K partials for one token group together.
+    long_queue = groups >= 2 * multiprocessors
+    partial_shape = (groups, splits, m, q) if long_queue else (splits, padded, q)
+    partial = torch.empty(partial_shape, dtype=torch.float32, device=device)
     sum_sq = torch.empty((padded,), dtype=torch.float32, device=device)
     # Ticket, packing counter and two counters per group. Allocation in the
     # caller's stream gives eager invocations and captured graphs private storage.
@@ -239,6 +243,7 @@ def _launch_pipeline(
         wave,
         lag,
         has_norm,
+        long_queue,
         num_warps=2,
         num_stages=1,
         enable_fp_fusion=False,

@@ -71,8 +71,11 @@ def _post(
     ROWS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     ALIGNED_ROWS: tl.constexpr,
+    I32_RESIDUAL_OFFSETS: tl.constexpr,
+    WRITE_THROUGH: tl.constexpr,
 ):
     rows = row_start + tl.arange(0, ROWS)
+    dense_rows = rows.to(tl.int32) if I32_RESIDUAL_OFFSETS else rows
     valid_rows = None if ALIGNED_ROWS else rows < T
     other_row = None if ALIGNED_ROWS else 0
     post_weights = ()
@@ -99,7 +102,7 @@ def _post(
             mask = valid_rows[:, None] & (h < H)[None, :]
         other = None if ALIGNED_ROWS and H % BLOCK_H == 0 else 0
         xv = tl.load(
-            X + rows[:, None] * H + h[None, :],
+            X + dense_rows[:, None] * H + h[None, :],
             mask,
             other,
             eviction_policy="evict_first",
@@ -108,7 +111,7 @@ def _post(
         for dst in tl.static_range(R):
             accum += (post_weights[dst][:, None] * xv,)
         for src in tl.static_range(R):
-            offset = (rows[:, None] * R + src) * H + h[None, :]
+            offset = (dense_rows[:, None] * R + src) * H + h[None, :]
             rv = tl.load(
                 Residual + offset, mask, other, eviction_policy="evict_first"
             ).to(tl.float32)
@@ -123,11 +126,12 @@ def _post(
             f = rounded.to(tl.float32)
             square = tl.fma(f, f, square)
             # Projection reads complete M tiles, including zero-padded rows.
-            offset = (rows[:, None] * R + dst) * H + h[None, :]
+            offset = (dense_rows[:, None] * R + dst) * H + h[None, :]
             tl.store(
                 NewResidual + offset,
                 rounded,
                 None if H % BLOCK_H == 0 else (h < H)[None, :],
+                cache_modifier=".wt" if WRITE_THROUGH else "",
                 eviction_policy="evict_last",
             )
     tl.store(SumSq + rows, tl.sum(square, 1), valid_rows)
@@ -146,6 +150,7 @@ def _project(
     M: tl.constexpr,
     BK: tl.constexpr,
     SPLITS: tl.constexpr,
+    GROUPED_PARTIALS: tl.constexpr,
 ):
     STEPS: tl.constexpr = triton.cdiv(triton.cdiv(K, BK), SPLITS)
     FULL_K: tl.constexpr = K % (SPLITS * BK) == 0
@@ -182,7 +187,10 @@ def _project(
         b0 = tl.advance(b0, (BK, 0))
         b1 = tl.advance(b1, (BK, 0))
         b2 = tl.advance(b2, (BK, 0))
-    row = part.to(tl.int64) * PAD_T + group.to(tl.int64) * M + tl.arange(0, M)
+    if GROUPED_PARTIALS:
+        row = (group.to(tl.int64) * SPLITS + part) * M + tl.arange(0, M)
+    else:
+        row = part.to(tl.int64) * PAD_T + group.to(tl.int64) * M + tl.arange(0, M)
     tl.store(Partial + row[:, None] * Q + tl.arange(0, Q)[None, :], main + correction)
 
 
@@ -209,17 +217,26 @@ def _epilogue(
     R: tl.constexpr,
     Q: tl.constexpr,
     PAD_T: tl.constexpr,
+    M: tl.constexpr,
     SPLITS: tl.constexpr,
     ROWS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     HAS_NORM: tl.constexpr,
     ALIGNED_ROWS: tl.constexpr,
+    GROUPED_PARTIALS: tl.constexpr,
 ):
     valid = None if ALIGNED_ROWS else rows < T
     projection = tl.zeros((ROWS, Q), tl.float32)
     q = tl.arange(0, Q)
+    if GROUPED_PARTIALS:
+        partial_rows = rows // M * SPLITS * M + rows % M
+        stride = M
+    else:
+        partial_rows = rows
+        stride = PAD_T
     for part in range(SPLITS):
-        projection += tl.load(Partial + (part * PAD_T + rows[:, None]) * Q + q[None, :])
+        offsets = (part * stride + partial_rows[:, None]) * Q + q[None, :]
+        projection += tl.load(Partial + offsets)
     sq = tl.load(SumSq + rows, valid, None if ALIGNED_ROWS else 0)
     logits = projection * tl.rsqrt(sq / (R * H) + rms_eps)[:, None]
 
@@ -352,6 +369,7 @@ def mega_mhc_pipeline(
     WAVE: tl.constexpr,
     LAG: tl.constexpr,
     HAS_NORM: tl.constexpr,
+    LONG_QUEUE: tl.constexpr,
 ):
     GROUPS: tl.constexpr = triton.cdiv(T, M)
     K: tl.constexpr = R * H
@@ -362,6 +380,8 @@ def mega_mhc_pipeline(
     EPILOGUES: tl.constexpr = M // ROWS_PER_JOB
     WAVE_JOBS: tl.constexpr = WAVE * (POSTS + SPLITS + EPILOGUES)
     ALIGN_T: tl.constexpr = T % M == 0
+    # Include the padded rows written by post in the largest dense offset.
+    I32_RESIDUAL_OFFSETS: tl.constexpr = LONG_QUEUE and GROUPS * M * K <= 2**31
     # Tickets impose a topological order independent of CTA launch order:
     # every poll waits only on producers that already received their tickets.
     ticket = tl.atomic_add(Counters, 1, sem="relaxed").to(tl.int32)
@@ -398,6 +418,8 @@ def mega_mhc_pipeline(
                         POST_ROWS,
                         256,
                         ALIGN_T,
+                        I32_RESIDUAL_OFFSETS,
+                        LONG_QUEUE,
                     )
                 tl.debug_barrier()
                 tl.atomic_add(ready + group * 2, 1, sem="acq_rel")
@@ -419,6 +441,7 @@ def mega_mhc_pipeline(
                     M,
                     BK,
                     SPLITS,
+                    LONG_QUEUE,
                 )
                 tl.debug_barrier()
                 tl.atomic_add(ready + group * 2 + 1, 1, sem="acq_rel")
@@ -457,9 +480,11 @@ def mega_mhc_pipeline(
                     R,
                     Q,
                     GROUPS * M,
+                    M,
                     SPLITS,
                     ROWS_PER_JOB,
                     256,
                     HAS_NORM,
                     ALIGN_T,
+                    LONG_QUEUE,
                 )
