@@ -1530,6 +1530,17 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: megamhc
+  description: Single-kernel mHC post-to-pre boundary for BF16 inference.
+  for:
+  - vllm.model_executor.kernels.mhc.mhc_fused_post_pre_tilelang
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: mhc_post
   description: Triton implementation of mHC Post operator (optimized v3).
   for:
