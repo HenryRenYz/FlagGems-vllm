@@ -32,9 +32,8 @@ def _pack_weights(
     BLOCK: tl.constexpr,
 ):
     flat = tile.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    k = flat // Q
-    p = flat % Q
-    value = tl.load(Fn + p * K + k, (k < K) & (p < P), 0.0)
+    p = flat // K
+    value = tl.load(Fn + flat, p < P, 0.0)
     high = value.to(tl.bfloat16)
     # The last finite FP32 bin rounds to infinity in BF16. Keep its excess
     # in the residual components, and propagate explicit non-finite weights.
@@ -47,10 +46,11 @@ def _pack_weights(
     rest = tl.where(finite, value - high.to(tl.float32), 0.0)
     middle = rest.to(tl.bfloat16)
     low = (rest - middle.to(tl.float32)).to(tl.bfloat16)
-    dst = Packed + k * (3 * Q) + p
-    tl.store(dst, high, k < K)
-    tl.store(dst + Q, middle, k < K)
-    tl.store(dst + 2 * Q, low, k < K)
+    # Each component is a [Q, K] plane with contiguous K for the MMA operand.
+    dst = Packed + flat
+    tl.store(dst, high, p < Q)
+    tl.store(dst + K * Q, middle, p < Q)
+    tl.store(dst + 2 * K * Q, low, p < Q)
 
 
 @triton.jit
@@ -153,9 +153,9 @@ def _project(
     a = tl.make_block_ptr(
         NewResidual, (PAD_T, K), (K, 1), (group * M, k0), (M, BK), (1, 0)
     )
-    b0 = tl.make_block_ptr(Packed, (K, 3 * Q), (3 * Q, 1), (k0, 0), (BK, Q), (1, 0))
-    b1 = tl.advance(b0, (0, Q))
-    b2 = tl.advance(b0, (0, 2 * Q))
+    b0 = tl.make_block_ptr(Packed, (K, Q), (1, K), (k0, 0), (BK, Q), (0, 1))
+    b1 = tl.make_block_ptr(Packed + K * Q, (K, Q), (1, K), (k0, 0), (BK, Q), (0, 1))
+    b2 = tl.make_block_ptr(Packed + 2 * K * Q, (K, Q), (1, K), (k0, 0), (BK, Q), (0, 1))
     main = tl.zeros((M, Q), tl.float32)
     correction = tl.zeros((M, Q), tl.float32)
     for _ in tl.range(STEPS, num_stages=2):

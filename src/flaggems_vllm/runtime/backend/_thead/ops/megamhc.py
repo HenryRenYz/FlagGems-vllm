@@ -205,7 +205,7 @@ def _launch_pipeline(
     residual = torch.empty(
         (padded, streams, hidden), dtype=torch.bfloat16, device=device
     )
-    packed = torch.empty((k, 3 * q), dtype=torch.bfloat16, device=device)
+    packed = torch.empty((3, q, k), dtype=torch.bfloat16, device=device)
     partial = torch.empty((splits, padded, q), dtype=torch.float32, device=device)
     sum_sq = torch.empty((padded,), dtype=torch.float32, device=device)
     # Ticket, packing counter and two counters per group. Allocation in the
