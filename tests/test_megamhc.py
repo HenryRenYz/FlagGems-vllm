@@ -46,7 +46,7 @@ def reference(args, use_norm=True):
     ).bfloat16()
     flat = new_residual.flatten(1).float()
     rms_eps, pre_eps, sink_eps, multiplier, repeats = EPS
-    projection = (flat @ fn.T) * torch.rsqrt(
+    projection = (flat.double() @ fn.double().T).float() * torch.rsqrt(
         flat.square().mean(-1, keepdim=True) + rms_eps
     )
     p, q, c = projection.split((streams, streams, streams * streams), dim=-1)
@@ -108,6 +108,42 @@ def test_mega_mhc_graph_replay():
         args[0].mul_(-0.75)
         graph.replay()
         verify(out, reference(args, use_norm=False))
+
+
+def test_mega_mhc_projection_cancellation():
+    tokens, hidden, streams = 4097, 521, 4
+    args = make_inputs(tokens, hidden, streams)
+    x, residual, post, comb, fn, scale, base, norm = args
+    x.zero_()
+    residual.fill_(1)
+    post.zero_()
+    comb.copy_(torch.eye(streams, device=comb.device))
+    fn.zero_()
+    scale.fill_(1)
+    base.zero_()
+    norm.fill_(1)
+
+    # The first post coefficient depends on a small FP32 remainder in each pair.
+    # Converting the weights to two BF16 terms can erase the remainder.
+    weight = 1.0 + 2**-9
+    fn[streams, 0::2] = weight + 2**-19
+    fn[streams, 1::2] = -weight
+
+    rows = torch.tensor([0, tokens // 2, tokens - 1], device=x.device)
+
+    def check(outputs):
+        sampled = tuple(a[rows] if i < 4 else a for i, a in enumerate(args))
+        verify(tuple(t[rows] for t in outputs), reference(sampled))
+
+    check(candidate(args))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = candidate(args)
+    for _ in range(2):
+        fn.neg_()
+        graph.replay()
+        check(outputs)
 
 
 def test_mega_mhc_empty():
