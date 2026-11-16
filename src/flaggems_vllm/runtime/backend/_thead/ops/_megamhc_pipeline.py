@@ -92,7 +92,9 @@ def _post(
             comb_weights += (tl.load(source, valid_rows, other_row),)
     columns = tl.arange(0, BLOCK_H)
     square = tl.zeros((ROWS, BLOCK_H), tl.float32)
-    for hstart in tl.range(0, H, BLOCK_H, num_stages=3, loop_unroll_factor=2):
+    # Keep less data live when the software pipeline has many hidden tiles.
+    UNROLL: tl.constexpr = 1 if H >= 8 * BLOCK_H else 2
+    for hstart in tl.range(0, H, BLOCK_H, num_stages=3, loop_unroll_factor=UNROLL):
         h = hstart + columns
         if H % BLOCK_H == 0:
             mask = None if ALIGNED_ROWS else valid_rows[:, None]
@@ -223,12 +225,12 @@ def _epilogue(
     BLOCK_H: tl.constexpr,
     HAS_NORM: tl.constexpr,
     ALIGNED_ROWS: tl.constexpr,
-    GROUPED_PARTIALS: tl.constexpr,
+    LONG_QUEUE: tl.constexpr,
 ):
     valid = None if ALIGNED_ROWS else rows < T
     projection = tl.zeros((ROWS, Q), tl.float32)
     q = tl.arange(0, Q)
-    if GROUPED_PARTIALS:
+    if LONG_QUEUE:
         partial_rows = rows // M * SPLITS * M + rows % M
         stride = M
     else:
@@ -291,7 +293,10 @@ def _epilogue(
         mix = tl.zeros((ROWS, BLOCK_H), tl.float32)
         for src in tl.static_range(R):
             v = tl.load(
-                NewResidual + (rows[:, None] * R + src) * H + h[None, :], mask, other
+                NewResidual + (rows[:, None] * R + src) * H + h[None, :],
+                mask,
+                other,
+                eviction_policy="evict_first" if LONG_QUEUE else "",
             ).to(tl.float32)
             mix = tl.fma(weights[src][:, None], v, mix)
         rounded = mix.to(tl.bfloat16)
@@ -309,7 +314,11 @@ def _epilogue(
         tl.debug_barrier()
         inv = tl.rsqrt(tl.sum(square, 1) / H + norm_eps)
         for start in tl.range(0, H, BLOCK_H, num_stages=1):
-            h = start + cols
+            if LONG_QUEUE:
+                # Read the most recently written BF16 tiles first.
+                h = (triton.cdiv(H, BLOCK_H) - 1) * BLOCK_H - start + cols
+            else:
+                h = start + cols
             if H % BLOCK_H == 0:
                 mask = row_mask
                 col_mask = None
@@ -327,7 +336,12 @@ def _epilogue(
             norm = tl.load(Norm + h, col_mask, None if H % BLOCK_H == 0 else 0).to(
                 tl.float32
             )
-            tl.store(Y + off, value * inv[:, None] * norm[None, :], mask)
+            tl.store(
+                Y + off,
+                value * inv[:, None] * norm[None, :],
+                mask,
+                cache_modifier=".wt" if LONG_QUEUE else "",
+            )
 
 
 @triton.jit
