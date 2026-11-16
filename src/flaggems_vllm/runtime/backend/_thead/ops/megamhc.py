@@ -197,8 +197,14 @@ def _launch_pipeline(
     padded = groups * m
     k = streams * hidden
     splits = min(8, triton.cdiv(k, bk))
-    # Shorter queues cannot amortize draining the overlapping stages.
+    # Long queues can amortize the drain between staggered stages.
     wave, lag = (8, 2) if groups >= 4 * multiprocessors else (min(groups, 32), 0)
+    short_wave = max(1, multiprocessors // 4)
+    if groups <= short_wave + short_wave // 4 and k * q >= 4096 * multiprocessors:
+        # A deep packing queue can dominate dispatch when there are only one
+        # or two token waves. Combine packing jobs and stagger the compute.
+        wave, lag = min(groups, short_wave), 1
+        pack_block = 8192 if groups <= short_wave else 4096
     jobs = (triton.cdiv(groups, wave) + 2 * lag) * wave * (2 * (m // 8) + splits)
     jobs += triton.cdiv(k * q, pack_block)
 
