@@ -205,7 +205,10 @@ def _launch_pipeline(
         # or two token waves. Combine packing jobs and stagger the compute.
         wave, lag = min(groups, short_wave), 1
         pack_block = 8192 if groups <= short_wave else 4096
-    jobs = (triton.cdiv(groups, wave) + 2 * lag) * wave * (2 * (m // 8) + splits)
+    waves = triton.cdiv(groups, wave)
+    compact_waves = lag > 0 and groups % wave == 0 and waves >= 2 * lag
+    scheduled_groups = groups if compact_waves else (waves + 2 * lag) * wave
+    jobs = scheduled_groups * (2 * (m // 8) + splits)
     jobs += triton.cdiv(k * q, pack_block)
 
     residual = torch.empty(
@@ -244,6 +247,7 @@ def _launch_pipeline(
         lag,
         has_norm,
         long_queue,
+        compact_waves,
         num_warps=2,
         num_stages=1,
         enable_fp_fusion=False,

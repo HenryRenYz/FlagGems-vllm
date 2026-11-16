@@ -153,9 +153,9 @@ def _project(
     BK: tl.constexpr,
     SPLITS: tl.constexpr,
     GROUPED_PARTIALS: tl.constexpr,
+    FULL_K: tl.constexpr,
 ):
     STEPS: tl.constexpr = triton.cdiv(triton.cdiv(K, BK), SPLITS)
-    FULL_K: tl.constexpr = K % (SPLITS * BK) == 0
     k0 = part * STEPS * BK
     a = tl.make_block_ptr(
         NewResidual, (PAD_T, K), (K, 1), (group * M, k0), (M, BK), (1, 0)
@@ -193,7 +193,11 @@ def _project(
         row = (group.to(tl.int64) * SPLITS + part) * M + tl.arange(0, M)
     else:
         row = part.to(tl.int64) * PAD_T + group.to(tl.int64) * M + tl.arange(0, M)
-    tl.store(Partial + row[:, None] * Q + tl.arange(0, Q)[None, :], main + correction)
+    tl.store(
+        Partial + row[:, None] * Q + tl.arange(0, Q)[None, :],
+        main + correction,
+        cache_modifier=".wt" if GROUPED_PARTIALS else "",
+    )
 
 
 @triton.jit
@@ -345,6 +349,44 @@ def _epilogue(
 
 
 @triton.jit
+def _compact_wave_slot(
+    work,
+    WAVES: tl.constexpr,
+    LAG: tl.constexpr,
+    POST_JOBS: tl.constexpr,
+    GEMM_JOBS: tl.constexpr,
+    EPI_JOBS: tl.constexpr,
+):
+    # At startup, post runs alone, then overlaps projection. During the
+    # drain, only projection and epilogue remain, followed by epilogue alone.
+    WAVE_JOBS: tl.constexpr = POST_JOBS + GEMM_JOBS + EPI_JOBS
+    HEAD0: tl.constexpr = LAG * POST_JOBS
+    HEAD1: tl.constexpr = HEAD0 + LAG * (POST_JOBS + GEMM_JOBS)
+    MIDDLE: tl.constexpr = HEAD1 + (WAVES - 2 * LAG) * WAVE_JOBS
+    TAIL: tl.constexpr = MIDDLE + LAG * (GEMM_JOBS + EPI_JOBS)
+    if work < HEAD0:
+        stripe = work // POST_JOBS
+        slot = work % POST_JOBS
+    elif work < HEAD1:
+        idx = work - HEAD0
+        stripe = LAG + idx // (POST_JOBS + GEMM_JOBS)
+        slot = idx % (POST_JOBS + GEMM_JOBS)
+    elif work < MIDDLE:
+        idx = work - HEAD1
+        stripe = 2 * LAG + idx // WAVE_JOBS
+        slot = idx % WAVE_JOBS
+    elif work < TAIL:
+        idx = work - MIDDLE
+        stripe = WAVES + idx // (GEMM_JOBS + EPI_JOBS)
+        slot = POST_JOBS + idx % (GEMM_JOBS + EPI_JOBS)
+    else:
+        idx = work - TAIL
+        stripe = WAVES + LAG + idx // EPI_JOBS
+        slot = POST_JOBS + GEMM_JOBS + idx % EPI_JOBS
+    return stripe, slot
+
+
+@triton.jit
 def mega_mhc_pipeline(
     X,
     Residual,
@@ -384,6 +426,7 @@ def mega_mhc_pipeline(
     LAG: tl.constexpr,
     HAS_NORM: tl.constexpr,
     LONG_QUEUE: tl.constexpr,
+    COMPACT_WAVES: tl.constexpr,
 ):
     GROUPS: tl.constexpr = triton.cdiv(T, M)
     K: tl.constexpr = R * H
@@ -407,9 +450,14 @@ def mega_mhc_pipeline(
         tl.atomic_add(packed_ready, 1, sem="acq_rel")
     else:
         work = ticket - PACK_JOBS
-        stripe = work // WAVE_JOBS
+        if COMPACT_WAVES:
+            stripe, slot = _compact_wave_slot(
+                work, GROUPS // WAVE, LAG, WAVE * POSTS, WAVE * SPLITS, WAVE * EPILOGUES
+            )
+        else:
+            stripe = work // WAVE_JOBS
+            slot = work % WAVE_JOBS
         start = stripe * WAVE
-        slot = work % WAVE_JOBS
         if slot < WAVE * POSTS:
             group = start + slot // POSTS
             if group < GROUPS:
@@ -443,20 +491,27 @@ def mega_mhc_pipeline(
             if group >= 0 and group < GROUPS:
                 _wait((ready + group * 2).to(tl.uint64), tl.full((), POSTS, tl.uint64))
                 _wait(packed_ready.to(tl.uint64), tl.full((), PACK_JOBS, tl.uint64))
-                _project(
-                    NewResidual,
-                    Packed,
-                    Partial,
-                    group,
-                    phase_slot % SPLITS,
-                    GROUPS * M,
-                    K,
-                    Q,
-                    M,
-                    BK,
-                    SPLITS,
-                    LONG_QUEUE,
-                )
+                part = phase_slot % SPLITS
+                # A narrow projection can use unmasked loads for complete
+                # K splits while keeping the bounds checks on its tail.
+                SPLIT_K: tl.constexpr = triton.cdiv(K, BK * SPLITS) * BK
+                project_args = (NewResidual, Packed, Partial, group, part)
+                if K % (SPLITS * BK) == 0 or (Q <= 16 and (part + 1) * SPLIT_K <= K):
+                    _project(
+                        *project_args, GROUPS * M, K, Q, M, BK, SPLITS, LONG_QUEUE, True
+                    )
+                else:
+                    _project(
+                        *project_args,
+                        GROUPS * M,
+                        K,
+                        Q,
+                        M,
+                        BK,
+                        SPLITS,
+                        LONG_QUEUE,
+                        False,
+                    )
                 tl.debug_barrier()
                 tl.atomic_add(ready + group * 2 + 1, 1, sem="acq_rel")
         else:
@@ -472,7 +527,7 @@ def mega_mhc_pipeline(
                     + (phase_slot % EPILOGUES) * ROWS_PER_JOB
                     + tl.arange(0, ROWS_PER_JOB)
                 )
-                _epilogue(
+                epilogue_args = (
                     Partial,
                     SumSq,
                     HCScale,
@@ -489,16 +544,36 @@ def mega_mhc_pipeline(
                     multiplier,
                     repeats,
                     norm_eps,
-                    T,
-                    H,
-                    R,
-                    Q,
-                    GROUPS * M,
-                    M,
-                    SPLITS,
-                    ROWS_PER_JOB,
-                    256,
-                    HAS_NORM,
-                    ALIGN_T,
-                    LONG_QUEUE,
                 )
+                if ALIGN_T or (H % 256 == 0 and group < GROUPS - 1):
+                    _epilogue(
+                        *epilogue_args,
+                        T,
+                        H,
+                        R,
+                        Q,
+                        GROUPS * M,
+                        M,
+                        SPLITS,
+                        ROWS_PER_JOB,
+                        256,
+                        HAS_NORM,
+                        True,
+                        LONG_QUEUE,
+                    )
+                else:
+                    _epilogue(
+                        *epilogue_args,
+                        T,
+                        H,
+                        R,
+                        Q,
+                        GROUPS * M,
+                        M,
+                        SPLITS,
+                        ROWS_PER_JOB,
+                        256,
+                        HAS_NORM,
+                        False,
+                        LONG_QUEUE,
+                    )
