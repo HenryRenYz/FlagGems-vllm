@@ -1,0 +1,465 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+import triton
+import triton.language as tl
+from triton.experimental.tle import language as tle
+from triton.language import core
+
+from flaggems_vllm.ops.mhc.mhc_pre import _mhc_recip
+
+
+@core.extern
+def _wait(address, expected, _semantic=None):
+    return core.extern_elementwise(
+        "megamhc",
+        "",
+        [address, expected],
+        {(tl.uint64, tl.uint64): ("megamhc_wait", tl.int32)},
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def _pack_weights(
+    Fn,
+    Packed,
+    tile,
+    K: tl.constexpr,
+    P: tl.constexpr,
+    Q: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    flat = tile.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    k = flat // Q
+    p = flat % Q
+    value = tl.load(Fn + p * K + k, (k < K) & (p < P), 0.0)
+    high = value.to(tl.bfloat16)
+    # The last finite FP32 bin rounds to infinity in BF16. Keep its excess
+    # in the residual components, and propagate explicit non-finite weights.
+    finite = tl.abs(value) < float("inf")
+    overflow = finite & (tl.abs(high.to(tl.float32)) == float("inf"))
+    truncated = (value.to(tl.uint32, bitcast=True) & 0xFFFF0000).to(
+        tl.float32, bitcast=True
+    )
+    high = tl.where(overflow, truncated, high.to(tl.float32)).to(tl.bfloat16)
+    rest = tl.where(finite, value - high.to(tl.float32), 0.0)
+    middle = rest.to(tl.bfloat16)
+    low = (rest - middle.to(tl.float32)).to(tl.bfloat16)
+    dst = Packed + k * (3 * Q) + p
+    tl.store(dst, high, k < K)
+    tl.store(dst + Q, middle, k < K)
+    tl.store(dst + 2 * Q, low, k < K)
+
+
+@triton.jit
+def _post(
+    X,
+    Residual,
+    Post,
+    Comb,
+    NewResidual,
+    SumSq,
+    row_start,
+    comb_stride_token,
+    comb_stride_src,
+    comb_stride_dst,
+    T: tl.constexpr,
+    H: tl.constexpr,
+    R: tl.constexpr,
+    ROWS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    ALIGNED_ROWS: tl.constexpr,
+):
+    rows = row_start + tl.arange(0, ROWS)
+    valid_rows = None if ALIGNED_ROWS else rows < T
+    other_row = None if ALIGNED_ROWS else 0
+    post_weights = ()
+    comb_weights = ()
+    for dst in tl.static_range(R):
+        post_weights += (tl.load(Post + rows * R + dst, valid_rows, other_row),)
+        for src in tl.static_range(R):
+            source = (
+                Comb
+                + rows * comb_stride_token
+                + src * comb_stride_src
+                + dst * comb_stride_dst
+            )
+            comb_weights += (tl.load(source, valid_rows, other_row),)
+    columns = tl.arange(0, BLOCK_H)
+    square = tl.zeros((ROWS, BLOCK_H), tl.float32)
+    for hstart in tl.range(0, H, BLOCK_H, num_stages=3, loop_unroll_factor=2):
+        h = hstart + columns
+        if H % BLOCK_H == 0:
+            mask = None if ALIGNED_ROWS else valid_rows[:, None]
+        elif ALIGNED_ROWS:
+            mask = (h < H)[None, :]
+        else:
+            mask = valid_rows[:, None] & (h < H)[None, :]
+        other = None if ALIGNED_ROWS and H % BLOCK_H == 0 else 0
+        xv = tl.load(
+            X + rows[:, None] * H + h[None, :],
+            mask,
+            other,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        accum = ()
+        for dst in tl.static_range(R):
+            accum += (post_weights[dst][:, None] * xv,)
+        for src in tl.static_range(R):
+            offset = (rows[:, None] * R + src) * H + h[None, :]
+            rv = tl.load(
+                Residual + offset, mask, other, eviction_policy="evict_first"
+            ).to(tl.float32)
+            updated = ()
+            for dst in tl.static_range(R):
+                updated += (
+                    tl.fma(comb_weights[dst * R + src][:, None], rv, accum[dst]),
+                )
+            accum = updated
+        for dst in tl.static_range(R):
+            rounded = accum[dst].to(tl.bfloat16)
+            f = rounded.to(tl.float32)
+            square = tl.fma(f, f, square)
+            # Projection reads complete M tiles, including zero-padded rows.
+            offset = (rows[:, None] * R + dst) * H + h[None, :]
+            tl.store(
+                NewResidual + offset,
+                rounded,
+                None if H % BLOCK_H == 0 else (h < H)[None, :],
+                eviction_policy="evict_last",
+            )
+    tl.store(SumSq + rows, tl.sum(square, 1), valid_rows)
+
+
+@triton.jit
+def _project(
+    NewResidual,
+    Packed,
+    Partial,
+    group,
+    part,
+    PAD_T: tl.constexpr,
+    K: tl.constexpr,
+    Q: tl.constexpr,
+    M: tl.constexpr,
+    BK: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    STEPS: tl.constexpr = triton.cdiv(triton.cdiv(K, BK), SPLITS)
+    FULL_K: tl.constexpr = K % (SPLITS * BK) == 0
+    k0 = part * STEPS * BK
+    a = tl.make_block_ptr(
+        NewResidual, (PAD_T, K), (K, 1), (group * M, k0), (M, BK), (1, 0)
+    )
+    b0 = tl.make_block_ptr(Packed, (K, 3 * Q), (3 * Q, 1), (k0, 0), (BK, Q), (1, 0))
+    b1 = tl.advance(b0, (0, Q))
+    b2 = tl.advance(b0, (0, 2 * Q))
+    main = tl.zeros((M, Q), tl.float32)
+    correction = tl.zeros((M, Q), tl.float32)
+    for _ in tl.range(STEPS, num_stages=2):
+        if FULL_K:
+            av = tle.load(a, is_async=True)
+            high = tle.load(b0, is_async=True)
+            middle = tle.load(b1, is_async=True)
+            low = tle.load(b2, is_async=True)
+        else:
+            av = tle.load(a, boundary_check=(1,), padding_option="zero", is_async=True)
+            high = tle.load(
+                b0, boundary_check=(0,), padding_option="zero", is_async=True
+            )
+            middle = tle.load(
+                b1, boundary_check=(0,), padding_option="zero", is_async=True
+            )
+            low = tle.load(
+                b2, boundary_check=(0,), padding_option="zero", is_async=True
+            )
+        main = tl.dot(av, high, main)
+        correction = tl.dot(av, middle, correction)
+        correction = tl.dot(av, low, correction)
+        a = tl.advance(a, (0, BK))
+        b0 = tl.advance(b0, (BK, 0))
+        b1 = tl.advance(b1, (BK, 0))
+        b2 = tl.advance(b2, (BK, 0))
+    row = part.to(tl.int64) * PAD_T + group.to(tl.int64) * M + tl.arange(0, M)
+    tl.store(Partial + row[:, None] * Q + tl.arange(0, Q)[None, :], main + correction)
+
+
+@triton.jit
+def _epilogue(
+    Partial,
+    SumSq,
+    HCScale,
+    HCBase,
+    NewResidual,
+    NewPost,
+    NewComb,
+    Norm,
+    Y,
+    rows,
+    rms_eps,
+    pre_eps,
+    sink_eps,
+    multiplier,
+    repeats,
+    norm_eps,
+    T: tl.constexpr,
+    H: tl.constexpr,
+    R: tl.constexpr,
+    Q: tl.constexpr,
+    PAD_T: tl.constexpr,
+    SPLITS: tl.constexpr,
+    ROWS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+    ALIGNED_ROWS: tl.constexpr,
+):
+    valid = None if ALIGNED_ROWS else rows < T
+    projection = tl.zeros((ROWS, Q), tl.float32)
+    q = tl.arange(0, Q)
+    for part in range(SPLITS):
+        projection += tl.load(Partial + (part * PAD_T + rows[:, None]) * Q + q[None, :])
+    sq = tl.load(SumSq + rows, valid, None if ALIGNED_ROWS else 0)
+    logits = projection * tl.rsqrt(sq / (R * H) + rms_eps)[:, None]
+
+    d = tl.arange(0, R)
+    pairs = tl.arange(0, R * R)
+    pidx = tl.broadcast_to(d[None, :], (ROWS, R))
+    cidx = tl.broadcast_to(pairs[None, :] + 2 * R, (ROWS, R * R))
+    pre = (
+        tl.sigmoid(
+            tl.gather(logits, pidx, 1) * tl.load(HCScale) + tl.load(HCBase + d)[None, :]
+        )
+        + pre_eps
+    )
+    post = tl.sigmoid(
+        tl.gather(logits, pidx + R, 1) * tl.load(HCScale + 1)
+        + tl.load(HCBase + R + d)[None, :]
+    )
+    row_mask = None if ALIGNED_ROWS else valid[:, None]
+    tl.store(NewPost + rows[:, None] * R + d[None, :], post * multiplier, row_mask)
+    c = (
+        tl.gather(logits, cidx, 1) * tl.load(HCScale + 2)
+        + tl.load(HCBase + 2 * R + pairs)[None, :]
+    ).reshape((ROWS, R, R))
+    c = tl.exp(c - tl.max(c, 2)[:, :, None])
+    c = c * _mhc_recip(tl.sum(c, 2))[:, :, None] + sink_eps
+    c = c * _mhc_recip(tl.sum(c, 1) + sink_eps)[:, None, :]
+    for _ in tl.range(1, repeats, loop_unroll_factor=4):
+        c = c * _mhc_recip(tl.sum(c, 2) + sink_eps)[:, :, None]
+        c = c * _mhc_recip(tl.sum(c, 1) + sink_eps)[:, None, :]
+    tl.store(
+        NewComb + rows[:, None] * R * R + pairs[None, :],
+        c.reshape((ROWS, R * R)),
+        row_mask,
+    )
+
+    cols = tl.arange(0, BLOCK_H)
+    square = tl.zeros((ROWS, BLOCK_H), tl.float32)
+    weights = ()
+    for src in tl.static_range(R):
+        weights += (
+            tl.gather(pre, tl.full((ROWS, 1), src, tl.int32), 1).reshape((ROWS,)),
+        )
+    for start in tl.range(0, H, BLOCK_H, num_stages=2):
+        h = start + cols
+        if H % BLOCK_H == 0:
+            mask = row_mask
+        elif ALIGNED_ROWS:
+            mask = (h < H)[None, :]
+        else:
+            mask = row_mask & (h < H)[None, :]
+        other = None if ALIGNED_ROWS and H % BLOCK_H == 0 else 0
+        mix = tl.zeros((ROWS, BLOCK_H), tl.float32)
+        for src in tl.static_range(R):
+            v = tl.load(
+                NewResidual + (rows[:, None] * R + src) * H + h[None, :], mask, other
+            ).to(tl.float32)
+            mix = tl.fma(weights[src][:, None], v, mix)
+        rounded = mix.to(tl.bfloat16)
+        if HAS_NORM:
+            f = rounded.to(tl.float32)
+            square = tl.fma(f, f, square)
+        tl.store(
+            Y + rows[:, None] * H + h[None, :],
+            rounded,
+            mask,
+            cache_modifier=".wb",
+            eviction_policy="evict_last",
+        )
+    if HAS_NORM:
+        tl.debug_barrier()
+        inv = tl.rsqrt(tl.sum(square, 1) / H + norm_eps)
+        for start in tl.range(0, H, BLOCK_H, num_stages=1):
+            h = start + cols
+            if H % BLOCK_H == 0:
+                mask = row_mask
+                col_mask = None
+            elif ALIGNED_ROWS:
+                col_mask = h < H
+                mask = col_mask[None, :]
+            else:
+                col_mask = h < H
+                mask = row_mask & col_mask[None, :]
+            other = None if ALIGNED_ROWS and H % BLOCK_H == 0 else 0
+            off = rows[:, None] * H + h[None, :]
+            value = tl.load(
+                Y + off, mask, other, cache_modifier=".ca", eviction_policy="evict_last"
+            ).to(tl.float32)
+            norm = tl.load(Norm + h, col_mask, None if H % BLOCK_H == 0 else 0).to(
+                tl.float32
+            )
+            tl.store(Y + off, value * inv[:, None] * norm[None, :], mask)
+
+
+@triton.jit
+def mega_mhc_pipeline(
+    X,
+    Residual,
+    Post,
+    Comb,
+    Fn,
+    HCScale,
+    HCBase,
+    Norm,
+    NewResidual,
+    NewPost,
+    NewComb,
+    Y,
+    Counters,
+    Packed,
+    Partial,
+    SumSq,
+    comb_stride_token,
+    comb_stride_src,
+    comb_stride_dst,
+    rms_eps,
+    pre_eps,
+    sink_eps,
+    multiplier,
+    repeats,
+    norm_eps,
+    T: tl.constexpr,
+    H: tl.constexpr,
+    R: tl.constexpr,
+    P: tl.constexpr,
+    Q: tl.constexpr,
+    M: tl.constexpr,
+    BK: tl.constexpr,
+    SPLITS: tl.constexpr,
+    PACK_BLOCK: tl.constexpr,
+    WAVE: tl.constexpr,
+    LAG: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+):
+    GROUPS: tl.constexpr = triton.cdiv(T, M)
+    K: tl.constexpr = R * H
+    PACK_JOBS: tl.constexpr = triton.cdiv(K * Q, PACK_BLOCK)
+    POST_ROWS: tl.constexpr = 2
+    ROWS_PER_JOB: tl.constexpr = 8
+    POSTS: tl.constexpr = M // ROWS_PER_JOB
+    EPILOGUES: tl.constexpr = M // ROWS_PER_JOB
+    WAVE_JOBS: tl.constexpr = WAVE * (POSTS + SPLITS + EPILOGUES)
+    ALIGN_T: tl.constexpr = T % M == 0
+    # Tickets impose a topological order independent of CTA launch order:
+    # every poll waits only on producers that already received their tickets.
+    ticket = tl.atomic_add(Counters, 1, sem="relaxed").to(tl.int32)
+    packed_ready = Counters + 1
+    ready = Counters + 2
+    if ticket < PACK_JOBS:
+        _pack_weights(Fn, Packed, ticket, K, P, Q, PACK_BLOCK)
+        tl.debug_barrier()
+        tl.atomic_add(packed_ready, 1, sem="acq_rel")
+    else:
+        work = ticket - PACK_JOBS
+        stripe = work // WAVE_JOBS
+        start = stripe * WAVE
+        slot = work % WAVE_JOBS
+        if slot < WAVE * POSTS:
+            group = start + slot // POSTS
+            if group < GROUPS:
+                row_start = group.to(tl.int64) * M + (slot % POSTS) * ROWS_PER_JOB
+                for step in tl.range(ROWS_PER_JOB // POST_ROWS, loop_unroll_factor=1):
+                    _post(
+                        X,
+                        Residual,
+                        Post,
+                        Comb,
+                        NewResidual,
+                        SumSq,
+                        row_start + step * POST_ROWS,
+                        comb_stride_token,
+                        comb_stride_src,
+                        comb_stride_dst,
+                        T,
+                        H,
+                        R,
+                        POST_ROWS,
+                        256,
+                        ALIGN_T,
+                    )
+                tl.debug_barrier()
+                tl.atomic_add(ready + group * 2, 1, sem="acq_rel")
+        elif slot < WAVE * (POSTS + SPLITS):
+            phase_slot = slot - WAVE * POSTS
+            group = start - LAG * WAVE + phase_slot // SPLITS
+            if group >= 0 and group < GROUPS:
+                _wait((ready + group * 2).to(tl.uint64), tl.full((), POSTS, tl.uint64))
+                _wait(packed_ready.to(tl.uint64), tl.full((), PACK_JOBS, tl.uint64))
+                _project(
+                    NewResidual,
+                    Packed,
+                    Partial,
+                    group,
+                    phase_slot % SPLITS,
+                    GROUPS * M,
+                    K,
+                    Q,
+                    M,
+                    BK,
+                    SPLITS,
+                )
+                tl.debug_barrier()
+                tl.atomic_add(ready + group * 2 + 1, 1, sem="acq_rel")
+        else:
+            phase_slot = slot - WAVE * (POSTS + SPLITS)
+            group = start - 2 * LAG * WAVE + phase_slot // EPILOGUES
+            if group >= 0 and group < GROUPS:
+                _wait(
+                    (ready + group * 2 + 1).to(tl.uint64),
+                    tl.full((), SPLITS, tl.uint64),
+                )
+                rows = (
+                    group.to(tl.int64) * M
+                    + (phase_slot % EPILOGUES) * ROWS_PER_JOB
+                    + tl.arange(0, ROWS_PER_JOB)
+                )
+                _epilogue(
+                    Partial,
+                    SumSq,
+                    HCScale,
+                    HCBase,
+                    NewResidual,
+                    NewPost,
+                    NewComb,
+                    Norm,
+                    Y,
+                    rows,
+                    rms_eps,
+                    pre_eps,
+                    sink_eps,
+                    multiplier,
+                    repeats,
+                    norm_eps,
+                    T,
+                    H,
+                    R,
+                    Q,
+                    GROUPS * M,
+                    SPLITS,
+                    ROWS_PER_JOB,
+                    256,
+                    HAS_NORM,
+                    ALIGN_T,
+                )

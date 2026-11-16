@@ -20,6 +20,7 @@ import triton
 from flaggems_vllm.runtime import device, torch_device_fn
 
 from ._megamhc_kernel import mega_mhc_kernel
+from ._megamhc_runtime import clear_counters, pipeline_runtime
 
 
 def mega_mhc(
@@ -93,18 +94,60 @@ def mega_mhc(
     ):
         raise ValueError("invalid MegaMHC combination weights")
 
-    new_residual = torch.empty_like(residual)
     new_post = torch.empty_like(post_layer_mix)
     new_comb = torch.empty(
         (tokens, streams, streams), device=x.device, dtype=torch.float32
     )
     y = torch.empty_like(x)
-    if tokens:
-        block_p = triton.next_power_of_2(mixes)
-        block_h = triton.next_power_of_2(hidden)
-        multiprocessors = torch.cuda.get_device_properties(
-            x.device
-        ).multi_processor_count
+    if not tokens:
+        return torch.empty_like(residual), new_post, new_comb, y
+
+    block_p = triton.next_power_of_2(mixes)
+    block_h = triton.next_power_of_2(hidden)
+    properties = torch.cuda.get_device_properties(x.device)
+    multiprocessors = properties.multi_processor_count
+    norm = norm_weight if norm_weight is not None else x
+    inputs = (x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base, norm)
+    outputs = (new_post, new_comb, y)
+    scalars = (
+        *comb_res_mix.stride(),
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_eps,
+    )
+    has_norm = norm_weight is not None
+    with torch_device_fn.device(x.device):
+        k = streams * hidden
+        # Small grids and wide projections favor the per-token path. The
+        # pipeline keeps its projection width within one narrow AIU tile.
+        if (
+            (properties.major, properties.minor) == (8, 0)
+            and tokens > 8 * multiprocessors
+            and tokens < 2**31
+            and k >= 256
+            and block_p <= 32
+        ):
+            runtime = pipeline_runtime()
+            if runtime is not None:
+                new_residual = _launch_pipeline(
+                    inputs,
+                    outputs,
+                    scalars,
+                    tokens,
+                    streams,
+                    hidden,
+                    mixes,
+                    max(16, block_p),
+                    has_norm,
+                    multiprocessors,
+                    runtime,
+                )
+                return new_residual, *outputs
+
+        new_residual = torch.empty_like(residual)
         # With only one CTA per token, use a wider K tile at low occupancy.
         # More waves favor fewer registers per CTA. Bound the accumulator for
         # larger stream counts as its size is proportional to the mix width.
@@ -114,35 +157,85 @@ def mega_mhc(
             block_k, warps = 256, 4
         else:
             block_k, warps = 128, 8 if block_p > 32 else 2
-        with torch_device_fn.device(x.device):
-            mega_mhc_kernel[(tokens,)](
-                x,
-                residual,
-                post_layer_mix,
-                comb_res_mix,
-                fn,
-                hc_scale,
-                hc_base,
-                norm_weight if norm_weight is not None else x,
-                new_residual,
-                new_post,
-                new_comb,
-                y,
-                *comb_res_mix.stride(),
-                rms_eps,
-                hc_pre_eps,
-                hc_sinkhorn_eps,
-                hc_post_mult_value,
-                sinkhorn_repeat,
-                norm_eps,
-                hidden,
-                streams,
-                mixes,
-                block_p,
-                min(block_k, block_h),
-                block_h,
-                norm_weight is not None,
-                num_warps=warps,
-                enable_fp_fusion=False,
-            )
-    return new_residual, new_post, new_comb, y
+        mega_mhc_kernel[(tokens,)](
+            *inputs,
+            new_residual,
+            *outputs,
+            *scalars,
+            hidden,
+            streams,
+            mixes,
+            block_p,
+            min(block_k, block_h),
+            block_h,
+            has_norm,
+            num_warps=warps,
+            enable_fp_fusion=False,
+        )
+    return new_residual, *outputs
+
+
+def _launch_pipeline(
+    inputs,
+    outputs,
+    scalars,
+    tokens,
+    streams,
+    hidden,
+    mixes,
+    q,
+    has_norm,
+    multiprocessors,
+    runtime,
+):
+    from ._megamhc_pipeline import mega_mhc_pipeline
+
+    memset, bitcode = runtime
+    device = inputs[0].device
+    m, bk, pack_block = 64, 64, 2048
+    groups = triton.cdiv(tokens, m)
+    padded = groups * m
+    k = streams * hidden
+    splits = min(8, triton.cdiv(k, bk))
+    # Shorter queues cannot amortize draining the overlapping stages.
+    wave, lag = (8, 2) if groups >= 4 * multiprocessors else (min(groups, 32), 0)
+    jobs = (triton.cdiv(groups, wave) + 2 * lag) * wave * (2 * (m // 8) + splits)
+    jobs += triton.cdiv(k * q, pack_block)
+
+    residual = torch.empty(
+        (padded, streams, hidden), dtype=torch.bfloat16, device=device
+    )
+    packed = torch.empty((k, 3 * q), dtype=torch.bfloat16, device=device)
+    partial = torch.empty((splits, padded, q), dtype=torch.float32, device=device)
+    sum_sq = torch.empty((padded,), dtype=torch.float32, device=device)
+    # Ticket, packing counter and two counters per group. Allocation in the
+    # caller's stream gives eager invocations and captured graphs private storage.
+    counters = torch.empty((2 + 2 * groups,), dtype=torch.int64, device=device)
+    clear_counters(counters, memset)
+    mega_mhc_pipeline[(jobs,)](
+        *inputs,
+        residual,
+        *outputs,
+        counters,
+        packed,
+        partial,
+        sum_sq,
+        *scalars,
+        tokens,
+        hidden,
+        streams,
+        mixes,
+        q,
+        m,
+        bk,
+        splits,
+        pack_block,
+        wave,
+        lag,
+        has_norm,
+        num_warps=2,
+        num_stages=1,
+        enable_fp_fusion=False,
+        extern_libs={"megamhc": bitcode},
+    )
+    return residual[:tokens]
