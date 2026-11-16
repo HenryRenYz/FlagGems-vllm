@@ -35,7 +35,9 @@ def _capture(call, args, warmup):
     return graph, outputs
 
 
-@pytest.mark.parametrize("tokens", [1, 24, 64, 128, 512, 1028, 2048, 3076, 16384])
+@pytest.mark.parametrize(
+    "tokens", [1, 24, 64, 128, 512, 1028, 2048, 3076, 4096, 8192, 16384, 32768]
+)
 def test_mega_mhc(tokens):
     args = make_inputs(tokens, 4096, 4)
     runs = [_capture(op, args, 20) for op in (split, candidate)]
