@@ -94,7 +94,11 @@ def mega_mhc_kernel(
             bf16 = (mixed + post * x).to(tl.bfloat16)
             tl.store(NewResidual + residual_base + dst * H + h, bf16, valid)
             value = bf16.to(tl.float32)
-            square_sum += value * value
+            # Wide K tiles benefit from fused FP32 square accumulation on PPU.
+            if BLOCK_K >= 256:
+                square_sum = tl.fma(value, value, square_sum)
+            else:
+                square_sum += value * value
             weight = tl.load(
                 Fn + p[:, None] * (R * H) + dst * H + h[None, :],
                 (p < P)[:, None] & valid[None, :],
