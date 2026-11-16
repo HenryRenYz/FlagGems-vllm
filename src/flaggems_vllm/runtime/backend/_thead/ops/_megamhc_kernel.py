@@ -15,6 +15,8 @@
 import triton
 import triton.language as tl
 
+from flaggems_vllm.ops.mhc.mhc_pre import _mhc_recip
+
 
 @triton.jit
 def mega_mhc_kernel(
@@ -56,22 +58,38 @@ def mega_mhc_kernel(
     projection = tl.zeros((BLOCK_P, BLOCK_K), tl.float32)
     square_sum = tl.zeros((BLOCK_K,), tl.float32)
 
+    # These coefficients are reused for every hidden tile.
+    post_values = ()
+    comb_values = ()
+    for dst in tl.static_range(R):
+        post_values += (tl.load(Post + token * R + dst),)
+        for src in tl.static_range(R):
+            comb_values += (
+                tl.load(
+                    Comb + comb_base + src * comb_stride_src + dst * comb_stride_dst
+                ),
+            )
+
     # Keep all projection heads and the row norm in the same CTA as the
     # residual writer. The projection uses the newly rounded BF16 residual.
     for start in range(0, H, BLOCK_K):
         h = start + k
         valid = h < H
         x = tl.load(X + input_base + h, valid, other=0).to(tl.float32)
+        # Load each residual source once per tile and reuse it for all outputs.
+        sources = ()
+        for src in tl.static_range(R):
+            sources += (
+                tl.load(Residual + residual_base + src * H + h, valid, other=0).to(
+                    tl.float32
+                ),
+            )
         for dst in tl.static_range(R):
-            post = tl.load(Post + token * R + dst)
+            post = post_values[dst]
             mixed = tl.zeros((BLOCK_K,), tl.float32)
             for src in tl.static_range(R):
-                coef = tl.load(
-                    Comb + comb_base + src * comb_stride_src + dst * comb_stride_dst
-                )
-                stream = tl.load(
-                    Residual + residual_base + src * H + h, valid, other=0
-                ).to(tl.float32)
+                coef = comb_values[dst * R + src]
+                stream = sources[src]
                 mixed = tl.fma(coef, stream, mixed)
             bf16 = (mixed + post * x).to(tl.bfloat16)
             tl.store(NewResidual + residual_base + dst * H + h, bf16, valid)
@@ -101,11 +119,11 @@ def mega_mhc_kernel(
         (R, R)
     )
     comb = tl.exp(comb - tl.max(comb, 1)[:, None])
-    comb = comb / tl.sum(comb, 1)[:, None] + sinkhorn_eps
-    comb = comb / (tl.sum(comb, 0)[None, :] + sinkhorn_eps)
-    for _ in range(1, sinkhorn_repeat):
-        comb = comb / (tl.sum(comb, 1)[:, None] + sinkhorn_eps)
-        comb = comb / (tl.sum(comb, 0)[None, :] + sinkhorn_eps)
+    comb = comb * _mhc_recip(tl.sum(comb, 1))[:, None] + sinkhorn_eps
+    comb = comb * _mhc_recip(tl.sum(comb, 0) + sinkhorn_eps)[None, :]
+    for _ in tl.range(1, sinkhorn_repeat, loop_unroll_factor=4):
+        comb = comb * _mhc_recip(tl.sum(comb, 1) + sinkhorn_eps)[:, None]
+        comb = comb * _mhc_recip(tl.sum(comb, 0) + sinkhorn_eps)[None, :]
     tl.store(NewComb + token * R * R + matrix_index, comb.reshape((R * R,)))
 
     # The layouts of the producer vectors and this full-row load can differ.

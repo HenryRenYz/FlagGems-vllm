@@ -83,7 +83,14 @@ def verify(result, expected):
 
 @pytest.mark.parametrize(
     "tokens,hidden,streams",
-    [(1, 4096, 4), (17, 259, 4), (3, 513, 2), (5, 127, 1), (3, 129, 8)],
+    [
+        (1, 4096, 4),
+        (17, 259, 4),
+        (3, 513, 2),
+        (5, 127, 1),
+        (3, 129, 8),
+        (4097, 259, 4),
+    ],
 )
 def test_mega_mhc(tokens, hidden, streams):
     args = make_inputs(tokens, hidden, streams, strided=True)

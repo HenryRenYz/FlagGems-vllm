@@ -108,12 +108,12 @@ def mega_mhc(
         # With only one CTA per token, use a wider K tile at low occupancy.
         # More waves favor fewer registers per CTA. Bound the accumulator for
         # larger stream counts as its size is proportional to the mix width.
-        if tokens <= multiprocessors and block_p <= 32:
-            block_k, warps = 512, 8
+        if tokens <= 2 * multiprocessors and block_p <= 32:
+            block_k, warps = 256, 8
         elif tokens <= 4 * multiprocessors and block_p <= 32:
             block_k, warps = 256, 4
         else:
-            block_k, warps = 128, 8 if block_p > 32 else 4
+            block_k, warps = 128, 8 if block_p > 32 else 2
         with torch_device_fn.device(x.device):
             mega_mhc_kernel[(tokens,)](
                 x,
