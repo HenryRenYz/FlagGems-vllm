@@ -16,6 +16,17 @@ from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
 
 
 @functools.lru_cache(maxsize=1)
+def pipeline_compiler_options():
+    """Use the PPU projection scheduling passes when FlagTree provides them."""
+    try:
+        from triton.backends.ppu.compiler import HGGCOptions
+    except ImportError:
+        return {}
+    options = ("ppu_peel_aiu_last", "ppu_schedule_ldmatrix")
+    return {name: True for name in options if hasattr(HGGCOptions, name)}
+
+
+@functools.lru_cache(maxsize=1)
 def pipeline_runtime():
     """Bind the PPU driver and cache the device-side CTA acquire helper."""
     if not has_triton_tle_attrs(("load",)):

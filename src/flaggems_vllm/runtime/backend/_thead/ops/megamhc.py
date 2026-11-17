@@ -20,7 +20,11 @@ import triton
 from flaggems_vllm.runtime import device, torch_device_fn
 
 from ._megamhc_kernel import mega_mhc_kernel
-from ._megamhc_runtime import clear_counters, pipeline_runtime
+from ._megamhc_runtime import (
+    clear_counters,
+    pipeline_compiler_options,
+    pipeline_runtime,
+)
 
 
 def mega_mhc(
@@ -252,5 +256,6 @@ def _launch_pipeline(
         num_stages=1,
         enable_fp_fusion=False,
         extern_libs={"megamhc": bitcode},
+        **pipeline_compiler_options(),
     )
     return residual[:tokens]
