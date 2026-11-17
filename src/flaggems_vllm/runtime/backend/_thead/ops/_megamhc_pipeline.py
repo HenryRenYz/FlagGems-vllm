@@ -387,6 +387,47 @@ def _compact_wave_slot(
 
 
 @triton.jit
+def _compact_partial_wave_slot(
+    work,
+    GROUPS: tl.constexpr,
+    WAVE: tl.constexpr,
+    LAG: tl.constexpr,
+    POSTS: tl.constexpr,
+    SPLITS: tl.constexpr,
+    EPILOGUES: tl.constexpr,
+):
+    FULL: tl.constexpr = GROUPS // WAVE
+    REM: tl.constexpr = GROUPS % WAVE
+    # Before the last partial wave, post leads GEMM by LAG and epilogue by 2*LAG.
+    PREFIX: tl.constexpr = (
+        FULL * (POSTS + SPLITS + EPILOGUES) - LAG * (SPLITS + 2 * EPILOGUES)
+    ) * WAVE
+    if work < PREFIX:
+        stripe, slot = _compact_wave_slot(
+            work, FULL, LAG, WAVE * POSTS, WAVE * SPLITS, WAVE * EPILOGUES
+        )
+    else:
+        tail = work - PREFIX
+        stripe = FULL
+        slot = 0
+        for i in tl.static_range(2 * LAG + 1):
+            posts = REM * POSTS if i == 0 else 0
+            gemms = (WAVE if i < LAG else REM if i == LAG else 0) * SPLITS
+            epilogues = (WAVE if i < 2 * LAG else REM) * EPILOGUES
+            if tail >= 0 and tail < posts + gemms + epilogues:
+                stripe = FULL + i
+                # Keep the same slot ranges used by the full-wave dispatcher.
+                if tail < posts:
+                    slot = tail
+                elif tail < posts + gemms:
+                    slot = WAVE * POSTS + tail - posts
+                else:
+                    slot = WAVE * (POSTS + SPLITS) + tail - posts - gemms
+            tail -= posts + gemms + epilogues
+    return stripe, slot
+
+
+@triton.jit
 def mega_mhc_pipeline(
     X,
     Residual,
@@ -450,7 +491,11 @@ def mega_mhc_pipeline(
         tl.atomic_add(packed_ready, 1, sem="acq_rel")
     else:
         work = ticket - PACK_JOBS
-        if COMPACT_WAVES:
+        if COMPACT_WAVES and GROUPS % WAVE:
+            stripe, slot = _compact_partial_wave_slot(
+                work, GROUPS, WAVE, LAG, POSTS, SPLITS, EPILOGUES
+            )
+        elif COMPACT_WAVES:
             stripe, slot = _compact_wave_slot(
                 work, GROUPS // WAVE, LAG, WAVE * POSTS, WAVE * SPLITS, WAVE * EPILOGUES
             )
