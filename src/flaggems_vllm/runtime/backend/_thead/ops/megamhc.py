@@ -201,9 +201,14 @@ def _launch_pipeline(
     padded = groups * m
     k = streams * hidden
     splits = min(8, triton.cdiv(k, bk))
+    compiler_options = pipeline_compiler_options()
+    early_prefetch = "ppu_fresh_output_args" in compiler_options
     # Long queues can amortize the drain between staggered stages.
     wave, lag = (8, 2) if groups >= 4 * multiprocessors else (min(groups, 32), 0)
     short_wave = max(1, multiprocessors // 4)
+    if early_prefetch and groups >= 2 * multiprocessors:
+        # Faster post and epilogue tiles benefit from a wider staggered wave.
+        wave, lag = short_wave, 1
     if groups <= short_wave + short_wave // 4 and k * q >= 4096 * multiprocessors:
         # A deep packing queue can dominate dispatch when there are only one
         # or two token waves. Combine packing jobs and stagger the compute.
@@ -221,7 +226,7 @@ def _launch_pipeline(
     packed = torch.empty((3, q, k), dtype=torch.bfloat16, device=device)
     # Long queues benefit from streaming residual stores and packing all
     # split-K partials for one token group together.
-    long_queue = groups >= 2 * multiprocessors
+    long_queue = groups >= (1 if early_prefetch else 2) * multiprocessors
     partial_shape = (groups, splits, m, q) if long_queue else (splits, padded, q)
     partial = torch.empty(partial_shape, dtype=torch.float32, device=device)
     sum_sq = torch.empty((padded,), dtype=torch.float32, device=device)
@@ -256,6 +261,6 @@ def _launch_pipeline(
         num_stages=1,
         enable_fp_fusion=False,
         extern_libs={"megamhc": bitcode},
-        **pipeline_compiler_options(),
+        **compiler_options,
     )
     return residual[:tokens]

@@ -17,13 +17,24 @@ from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
 
 @functools.lru_cache(maxsize=1)
 def pipeline_compiler_options():
-    """Use the PPU projection scheduling passes when FlagTree provides them."""
+    """Use the PPU pipeline scheduling passes when FlagTree provides them."""
     try:
         from triton.backends.ppu.compiler import HGGCOptions
     except ImportError:
         return {}
-    options = ("ppu_peel_aiu_last", "ppu_schedule_ldmatrix")
-    return {name: True for name in options if hasattr(HGGCOptions, name)}
+    options = {
+        name: True
+        for name in ("ppu_peel_aiu_last", "ppu_schedule_ldmatrix")
+        if hasattr(HGGCOptions, name)
+    }
+    if hasattr(HGGCOptions, "ppu_fresh_output_args"):
+        from ._megamhc_pipeline import mega_mhc_pipeline
+
+        # These outputs are freshly allocated and disjoint from their inputs.
+        options["ppu_fresh_output_args"] = tuple(
+            mega_mhc_pipeline.arg_names.index(name) for name in ("NewResidual", "Y")
+        )
+    return options
 
 
 @functools.lru_cache(maxsize=1)
