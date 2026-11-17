@@ -35,12 +35,8 @@ def _capture(call, args, warmup):
     return graph, outputs
 
 
-@pytest.mark.parametrize(
-    "tokens", [1, 24, 64, 128, 512, 1028, 2048, 3076, 4096, 8192, 16384, 32768]
-)
-def test_mega_mhc(tokens):
-    args = make_inputs(tokens, 4096, 4)
-    runs = [_capture(op, args, 20) for op in (split, candidate)]
+def _paired_graph_medians(args, fused_op):
+    runs = [_capture(op, args, 20) for op in (split, fused_op)]
     graphs = [graph for graph, _ in runs]
     samples = [[], []]
     start = torch.cuda.Event(enable_timing=True)
@@ -52,7 +48,32 @@ def test_mega_mhc(tokens):
             end.record()
             end.synchronize()
             samples[j].append(start.elapsed_time(end) * 1000)
-    baseline, fused = map(statistics.median, samples)
+    return tuple(map(statistics.median, samples))
+
+
+@pytest.mark.parametrize(
+    "tokens", [1, 24, 64, 128, 512, 1028, 2048, 3076, 4096, 8192, 16384, 32768]
+)
+def test_mega_mhc(tokens):
+    args = make_inputs(tokens, 4096, 4)
+    baseline, fused = _paired_graph_medians(args, candidate)
     print(
         f"MegaMHC CUDA Graph T={tokens} split={baseline:.3f} us fused={fused:.3f} us {baseline / fused:.4f}x"
+    )
+
+
+@pytest.mark.parametrize("tokens", [4096, 8192, 16384, 32768])
+def test_mega_mhc_prepacked(tokens):
+    args = make_inputs(tokens, 4096, 4)
+    # Both operators prepare their weights before capture. Keep the packed
+    # tensor alive until all replays have finished.
+    packed = gems.pack_mega_mhc_weights(args[4])
+
+    def fused_op(inputs):
+        return candidate(inputs, packed_fn=packed)
+
+    baseline, fused = _paired_graph_medians(args, fused_op)
+    print(
+        f"MegaMHC prepacked CUDA Graph T={tokens} "
+        f"split={baseline:.3f} us fused={fused:.3f} us {baseline / fused:.4f}x"
     )

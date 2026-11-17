@@ -36,7 +36,10 @@ from flaggems_vllm.runtime.backend._thead.ops.input_batch import (
     get_num_sampled_and_rejected,
 )
 from flaggems_vllm.runtime.backend._thead.ops.int8_einsum import int8_einsum
-from flaggems_vllm.runtime.backend._thead.ops.megamhc import mega_mhc
+from flaggems_vllm.runtime.backend._thead.ops.megamhc import (
+    mega_mhc,
+    pack_mega_mhc_weights,
+)
 from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -64,6 +67,7 @@ __all__ = [
     "mega_mhc",
     "int8_einsum",
     "outplace_fused_experts",
+    "pack_mega_mhc_weights",
     "per_token_group_quant_fp8",
     "persistent_topk",
     "qsa_prepare",

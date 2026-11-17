@@ -69,8 +69,13 @@ def reference(args, use_norm=True):
     return new_residual, new_post, new_comb, y
 
 
-def candidate(args, use_norm=True):
-    return gems.mega_mhc(*args[:-1], *EPS, norm_weight=args[-1] if use_norm else None)
+def candidate(args, use_norm=True, *, packed_fn=None):
+    return gems.mega_mhc(
+        *args[:-1],
+        *EPS,
+        norm_weight=args[-1] if use_norm else None,
+        packed_fn=packed_fn,
+    )
 
 
 def verify(result, expected):
@@ -146,6 +151,31 @@ def test_mega_mhc_projection_cancellation(tokens):
         fn.neg_()
         graph.replay()
         check(outputs)
+
+
+@pytest.mark.parametrize("hidden,streams", [(521, 4), (259, 2)])
+def test_mega_mhc_prepacked_graph_replay(hidden, streams):
+    args = make_inputs(4097, hidden, streams, strided=True)
+    packed = gems.pack_mega_mhc_weights(args[4])
+    # Keep the original weights for the reference and change the input
+    # weights after capture to verify the graph reads the packed snapshot.
+    frozen_args = (*args[:4], args[4].clone(), *args[5:])
+    candidate(args, packed_fn=packed)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = candidate(args, packed_fn=packed)
+
+    args[4].neg_()
+    sample_rows = [0, 2048, 4096]
+    for _ in range(2):
+        args[0].mul_(-0.75)
+        graph.replay()
+        sampled = tuple(
+            value[sample_rows] if i < 4 else value
+            for i, value in enumerate(frozen_args)
+        )
+        verify(tuple(value[sample_rows] for value in outputs), reference(sampled))
 
 
 def test_mega_mhc_empty():

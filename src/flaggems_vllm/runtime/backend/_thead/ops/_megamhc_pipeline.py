@@ -54,6 +54,13 @@ def _pack_weights(
 
 
 @triton.jit
+def pack_mega_mhc_weights_kernel(
+    Fn, Packed, K: tl.constexpr, P: tl.constexpr, Q: tl.constexpr, BLOCK: tl.constexpr
+):
+    _pack_weights(Fn, Packed, tl.program_id(0), K, P, Q, BLOCK)
+
+
+@triton.jit
 def _post(
     X,
     Residual,
@@ -468,10 +475,11 @@ def mega_mhc_pipeline(
     HAS_NORM: tl.constexpr,
     LONG_QUEUE: tl.constexpr,
     COMPACT_WAVES: tl.constexpr,
+    PREPACKED: tl.constexpr = False,
 ):
     GROUPS: tl.constexpr = triton.cdiv(T, M)
     K: tl.constexpr = R * H
-    PACK_JOBS: tl.constexpr = triton.cdiv(K * Q, PACK_BLOCK)
+    PACK_JOBS: tl.constexpr = 0 if PREPACKED else triton.cdiv(K * Q, PACK_BLOCK)
     POST_ROWS: tl.constexpr = 2
     ROWS_PER_JOB: tl.constexpr = 8
     POSTS: tl.constexpr = M // ROWS_PER_JOB
@@ -484,8 +492,8 @@ def mega_mhc_pipeline(
     # every poll waits only on producers that already received their tickets.
     ticket = tl.atomic_add(Counters, 1, sem="relaxed").to(tl.int32)
     packed_ready = Counters + 1
-    ready = Counters + 2
-    if ticket < PACK_JOBS:
+    ready = Counters + (1 if PREPACKED else 2)
+    if not PREPACKED and ticket < PACK_JOBS:
         _pack_weights(Fn, Packed, ticket, K, P, Q, PACK_BLOCK)
         tl.debug_barrier()
         tl.atomic_add(packed_ready, 1, sem="acq_rel")
@@ -535,7 +543,8 @@ def mega_mhc_pipeline(
             group = start - LAG * WAVE + phase_slot // SPLITS
             if group >= 0 and group < GROUPS:
                 _wait((ready + group * 2).to(tl.uint64), tl.full((), POSTS, tl.uint64))
-                _wait(packed_ready.to(tl.uint64), tl.full((), PACK_JOBS, tl.uint64))
+                if not PREPACKED:
+                    _wait(packed_ready.to(tl.uint64), tl.full((), PACK_JOBS, tl.uint64))
                 part = phase_slot % SPLITS
                 # A narrow projection can use unmasked loads for complete
                 # K splits while keeping the bounds checks on its tail.

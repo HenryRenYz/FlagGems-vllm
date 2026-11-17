@@ -27,6 +27,32 @@ from ._megamhc_runtime import (
 )
 
 
+def pack_mega_mhc_weights(fn):
+    """Prepare the three BF16 projection components before Graph capture."""
+    if device.vendor_name != "thead" or fn.device.type != "cuda":
+        raise NotImplementedError("MegaMHC requires T-Head PPU")
+    if (
+        fn.ndim != 2
+        or not all(fn.shape)
+        or fn.dtype != torch.float32
+        or not fn.is_contiguous()
+        or fn.requires_grad
+    ):
+        raise ValueError("expected a nonempty contiguous FP32 inference weight matrix")
+
+    from ._megamhc_pipeline import pack_mega_mhc_weights_kernel
+
+    p, k = fn.shape
+    q = max(16, triton.next_power_of_2(p))
+    packed = torch.empty((3, q, k), dtype=torch.bfloat16, device=fn.device)
+    block = 2048
+    with torch_device_fn.device(fn.device):
+        pack_mega_mhc_weights_kernel[(triton.cdiv(q * k, block),)](
+            fn, packed, k, p, q, block, num_warps=2, enable_fp_fusion=False
+        )
+    return packed
+
+
 def mega_mhc(
     x,
     residual,
@@ -44,12 +70,20 @@ def mega_mhc(
     tile_n=1,
     norm_weight=None,
     norm_eps=1e-6,
+    *,
+    packed_fn=None,
 ):
     """Fuse the normal mHC post-to-pre boundary for BF16 inference on PPU.
 
     Combination weights index [token, source stream, destination stream].
     Returns the BF16 updated residual, FP32 post and combination coefficients,
     and the BF16 collapsed layer input with optional RMS normalization.
+
+    For fixed weights, pass the result of pack_mega_mhc_weights(fn) as packed_fn
+    to the large-input pipeline. Keep fn and its packed weights consistent and
+    keep packed_fn alive for the lifetime of any graph that captures it.
+    The per-token path reads fn directly. Omit packed_fn when updating fn
+    between graph replays.
     """
     if device.vendor_name != "thead" or residual.device.type != "cuda":
         raise NotImplementedError("MegaMHC requires T-Head PPU")
@@ -108,6 +142,16 @@ def mega_mhc(
 
     block_p = triton.next_power_of_2(mixes)
     block_h = triton.next_power_of_2(hidden)
+    k = streams * hidden
+    q = max(16, block_p)
+    if packed_fn is not None and (
+        packed_fn.shape != (3, q, k)
+        or packed_fn.dtype != torch.bfloat16
+        or packed_fn.device != x.device
+        or not packed_fn.is_contiguous()
+        or packed_fn.requires_grad
+    ):
+        raise ValueError("invalid MegaMHC packed projection weights")
     properties = torch.cuda.get_device_properties(x.device)
     multiprocessors = properties.multi_processor_count
     norm = norm_weight if norm_weight is not None else x
@@ -124,7 +168,6 @@ def mega_mhc(
     )
     has_norm = norm_weight is not None
     with torch_device_fn.device(x.device):
-        k = streams * hidden
         # Small grids and wide projections favor the per-token path. The
         # pipeline keeps its projection width within one narrow AIU tile.
         if (
@@ -144,10 +187,11 @@ def mega_mhc(
                     streams,
                     hidden,
                     mixes,
-                    max(16, block_p),
+                    q,
                     has_norm,
                     multiprocessors,
                     runtime,
+                    packed_fn=packed_fn,
                 )
                 return new_residual, *outputs
 
@@ -191,6 +235,8 @@ def _launch_pipeline(
     has_norm,
     multiprocessors,
     runtime,
+    *,
+    packed_fn=None,
 ):
     from ._megamhc_pipeline import mega_mhc_pipeline
 
@@ -212,7 +258,12 @@ def _launch_pipeline(
             wave, lag = max(1, multiprocessors // 8), 3
         elif groups >= 2 * multiprocessors:
             wave, lag = short_wave, 1
-    if groups <= short_wave + short_wave // 4 and k * q >= 4096 * multiprocessors:
+    prepacked = packed_fn is not None
+    if (
+        not prepacked
+        and groups <= short_wave + short_wave // 4
+        and k * q >= 4096 * multiprocessors
+    ):
         # A deep packing queue can dominate dispatch when there are only one
         # or two token waves. Combine packing jobs and stagger the compute.
         wave, lag = min(groups, short_wave), 1
@@ -223,28 +274,31 @@ def _launch_pipeline(
     )
     scheduled_groups = groups if compact_waves else (waves + 2 * lag) * wave
     jobs = scheduled_groups * (2 * (m // 8) + splits)
-    jobs += triton.cdiv(k * q, pack_block)
+    if not prepacked:
+        jobs += triton.cdiv(k * q, pack_block)
+        packed_fn = torch.empty((3, q, k), dtype=torch.bfloat16, device=device)
 
     residual = torch.empty(
         (padded, streams, hidden), dtype=torch.bfloat16, device=device
     )
-    packed = torch.empty((3, q, k), dtype=torch.bfloat16, device=device)
     # Long queues benefit from streaming residual stores and packing all
     # split-K partials for one token group together.
     long_queue = groups >= (1 if early_prefetch else 2) * multiprocessors
     partial_shape = (groups, splits, m, q) if long_queue else (splits, padded, q)
     partial = torch.empty(partial_shape, dtype=torch.float32, device=device)
     sum_sq = torch.empty((padded,), dtype=torch.float32, device=device)
-    # Ticket, packing counter and two counters per group. Allocation in the
+    # Ticket, optional packing counter and two counters per group. Allocation in the
     # caller's stream gives eager invocations and captured graphs private storage.
-    counters = torch.empty((2 + 2 * groups,), dtype=torch.int64, device=device)
+    counters = torch.empty(
+        (1 + int(not prepacked) + 2 * groups,), dtype=torch.int64, device=device
+    )
     clear_counters(counters, memset)
     mega_mhc_pipeline[(jobs,)](
         *inputs,
         residual,
         *outputs,
         counters,
-        packed,
+        packed_fn,
         partial,
         sum_sq,
         *scalars,
@@ -262,6 +316,7 @@ def _launch_pipeline(
         has_norm,
         long_queue,
         compact_waves,
+        PREPACKED=prepacked,
         num_warps=2,
         num_stages=1,
         enable_fp_fusion=False,
